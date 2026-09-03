@@ -1,0 +1,138 @@
+services:
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    image: telemetry-api:local
+    command: ["/app/api"]
+    entrypoint: ["/bin/sh", "/entrypoints/api-entrypoint.sh"]
+    environment:
+      REDIS_ADDR: redis:6379
+      APP_CONFIG: /config/app.json
+      SCRATCH_DIR: /var/run/telemetry
+      API_BOOT_DELAY_MS: ${API_BOOT_DELAY_MS:-2500}
+    volumes:
+      - ./docker/entrypoints/api-entrypoint.sh:/entrypoints/api-entrypoint.sh:ro
+      - ./config/app.json:/config/app.json:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /var/run/telemetry
+      - /tmp
+    stop_grace_period: 10s
+    healthcheck:
+      # End-to-end readiness check:
+      # - /ready must be 200 (redis reachable + worker consumer ready)
+      # - api can enqueue (POST /events)
+      # - worker can compact (compacted:count increases)
+      test:
+        - "CMD-SHELL"
+        - >-
+          set -eu;
+          done_file="/var/run/telemetry/health.done";
+          if [ -f "$done_file" ]; then
+            wget -q --spider http://localhost:8080/ready >/dev/null 2>&1;
+            exit $?;
+          fi;
+          wget -q --spider http://localhost:8080/ready >/dev/null 2>&1 || exit 1;
+          before="$(redis-cli -h redis -p 6379 GET compacted:count 2>/dev/null | tr -d '\r')";
+          case "$before" in ''|'(nil)') before=0;; esac;
+          wget -qO- --header='Content-Type: application/json' --post-data='{"source":"health","seq":1}' http://localhost:8080/events >/dev/null 2>&1 || exit 1;
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            after="$(redis-cli -h redis -p 6379 GET compacted:count 2>/dev/null | tr -d '\r')";
+            case "$after" in ''|'(nil)') after=0;; esac;
+            if [ "$after" -gt "$before" ] 2>/dev/null; then
+              touch "$done_file";
+              exit 0;
+            fi;
+            sleep 0.2;
+          done;
+          exit 1
+      interval: 2s
+      timeout: 6s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  worker:
+    build:
+      context: ./services/worker
+      dockerfile: Dockerfile
+    image: telemetry-worker:local
+    command: ["/app/worker"]
+    entrypoint: ["/bin/sh", "/entrypoints/worker-entrypoint.sh"]
+    environment:
+      REDIS_ADDR: redis:6379
+      DATA_DIR: /data
+      COMPACTOR_INTERVAL_MS: ${COMPACTOR_INTERVAL_MS:-200}
+      COMPACTOR_BATCH_SIZE: ${COMPACTOR_BATCH_SIZE:-25}
+      WORKER_ALLOC_BYTES: ${WORKER_ALLOC_BYTES:-50331648}
+    volumes:
+      - ./docker/entrypoints/worker-entrypoint.sh:/entrypoints/worker-entrypoint.sh:ro
+      - worker-data:/data
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 32m
+    cpus: 0.25
+    stop_grace_period: 10s
+    healthcheck:
+      # End-to-end readiness check (compaction):
+      # - worker:ready must be 1
+      # - pushing a test event into telemetry:events must increase compacted:count
+      test:
+        - "CMD-SHELL"
+        - >-
+          set -eu;
+          done_file=/tmp/health.done;
+          if [ -f "$done_file" ]; then
+            v="$(redis-cli -h redis -p 6379 GET worker:ready 2>/dev/null | tr -d '\r')";
+            [ "$v" = "1" ] && exit 0 || exit 1;
+          fi;
+          v="$(redis-cli -h redis -p 6379 GET worker:ready 2>/dev/null | tr -d '\r')";
+          [ "$v" = "1" ] || exit 1;
+          before="$(redis-cli -h redis -p 6379 GET compacted:count 2>/dev/null | tr -d '\r')";
+          case "$before" in ''|'(nil)') before=0;; esac;
+          redis-cli -h redis -p 6379 RPUSH telemetry:events "health|$(date +%s%N)" >/dev/null;
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            after="$(redis-cli -h redis -p 6379 GET compacted:count 2>/dev/null | tr -d '\r')";
+            case "$after" in ''|'(nil)') after=0;; esac;
+            if [ "$after" -gt "$before" ] 2>/dev/null; then
+              touch "$done_file";
+              exit 0;
+            fi;
+            sleep 0.2;
+          done;
+          exit 1
+      interval: 2s
+      timeout: 6s
+      retries: 10
+      start_period: 5s
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+    restart: "no"
+
+volumes:
+  redis-data:
+  worker-data:

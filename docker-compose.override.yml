@@ -1,0 +1,4 @@
+services:
+  worker:
+    environment:
+      COMPACTOR_BATCH_SIZE: "75"
